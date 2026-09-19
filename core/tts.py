@@ -444,3 +444,125 @@ def create_tts_player(config: dict) -> TTSPlayer:
         voice  = config.get("tts_voice", "en-US-GuyNeural")
         engine = EdgeTTSEngine(voice=voice)
     return TTSPlayer(engine)
+
+
+class StreamingTTSQueue:
+    """
+    Asynchronous sentence-level TTS Queue.
+    Accepts text chunks / sentences on the fly.
+    Sentence N plays while sentence N+1 is being synthesised.
+    Supports instant stop / interruption (< 20 ms).
+    """
+
+    def __init__(self, tts_player: Optional[TTSPlayer] = None):
+        self._player = tts_player
+        self._queue: _queue.Queue[Optional[str]] = _queue.Queue()
+        self._lock = threading.Lock()
+        self._running = True
+        self._interrupted = False
+        self._is_speaking = False
+        self._on_start_cb: Optional[Callable] = None
+        self._on_done_cb: Optional[Callable] = None
+
+        self._worker_thread = threading.Thread(target=self._worker, daemon=True, name="StreamingTTSWorker")
+        self._worker_thread.start()
+
+    def set_player(self, player: TTSPlayer) -> None:
+        with self._lock:
+            self._player = player
+
+    def set_callbacks(self, on_start: Optional[Callable] = None, on_done: Optional[Callable] = None) -> None:
+        self._on_start_cb = on_start
+        self._on_done_cb = on_done
+
+    @property
+    def is_speaking(self) -> bool:
+        return self._is_speaking or (self._player.is_playing if self._player else False)
+
+    def enqueue_sentence(self, sentence: str) -> None:
+        s = sentence.strip()
+        if not s:
+            return
+        with self._lock:
+            self._interrupted = False
+            self._queue.put(s)
+
+    def finish_stream(self) -> None:
+        """Mark end of current response stream."""
+        self._queue.put(None)
+
+    def stop_immediately(self) -> None:
+        """Instant interrupt: drain queue and halt sound playback immediately."""
+        with self._lock:
+            self._interrupted = True
+            # Drain queue
+            while True:
+                try:
+                    self._queue.get_nowait()
+                except _queue.Empty:
+                    break
+            self._is_speaking = False
+            if self._player:
+                self._player.stop()
+            sd.stop()
+        if self._on_done_cb:
+            try:
+                self._on_done_cb()
+            except Exception:
+                pass
+
+    def _worker(self) -> None:
+        while self._running:
+            try:
+                sentence = self._queue.get(timeout=0.1)
+            except _queue.Empty:
+                continue
+
+            if sentence is None:
+                # End of a response turn
+                self._is_speaking = False
+                if self._on_done_cb:
+                    try:
+                        self._on_done_cb()
+                    except Exception:
+                        pass
+                continue
+
+            with self._lock:
+                if self._interrupted:
+                    continue
+                self._is_speaking = True
+
+            if self._on_start_cb:
+                try:
+                    self._on_start_cb()
+                except Exception:
+                    pass
+
+            try:
+                if self._player and not self._interrupted:
+                    self._player.speak(sentence)
+            except Exception as e:
+                print(f"[StreamingTTS] Error speaking sentence: {e}")
+            finally:
+                with self._lock:
+                    if self._queue.empty():
+                        self._is_speaking = False
+
+
+_GLOBAL_STREAMING_QUEUE: Optional[StreamingTTSQueue] = None
+_GLOBAL_QUEUE_LOCK = threading.Lock()
+
+def get_streaming_tts_queue(config: Optional[dict] = None) -> StreamingTTSQueue:
+    global _GLOBAL_STREAMING_QUEUE
+    if _GLOBAL_STREAMING_QUEUE is None:
+        with _GLOBAL_QUEUE_LOCK:
+            if _GLOBAL_STREAMING_QUEUE is None:
+                cfg = config or {}
+                player = None
+                try:
+                    player = create_tts_player(cfg)
+                except Exception as e:
+                    print(f"[TTS] Warning creating default player: {e}")
+                _GLOBAL_STREAMING_QUEUE = StreamingTTSQueue(player)
+    return _GLOBAL_STREAMING_QUEUE

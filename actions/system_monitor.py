@@ -111,8 +111,16 @@ def _get_cpu_temp() -> float:
 
 
 def get_system_status() -> dict:
-    """Snapshot of current system metrics for the system_status tool."""
-    cpu  = psutil.cpu_percent(interval=0.2)
+    """Snapshot of current system metrics for the system_status tool (cached with 2.0s TTL)."""
+    try:
+        from core.cache_manager import get_cache
+        cached = get_cache().get("system_status_snapshot")
+        if cached is not None:
+            return cached
+    except Exception:
+        pass
+
+    cpu  = psutil.cpu_percent(interval=None)
     ram  = psutil.virtual_memory()
     temp = _get_cpu_temp()
     gpu  = _get_gpu_usage()
@@ -122,7 +130,7 @@ def get_system_status() -> dict:
     uptime_h    = int(uptime_secs // 3600)
     uptime_m    = int((uptime_secs % 3600) // 60)
 
-    return {
+    result = {
         "cpu_percent":   round(cpu, 1),
         "ram_percent":   round(ram.percent, 1),
         "ram_used_gb":   round(ram.used   / 1024 ** 3, 1),
@@ -132,6 +140,14 @@ def get_system_status() -> dict:
         "uptime":        f"{uptime_h}h {uptime_m}m",
         "process_count": len(psutil.pids()),
     }
+
+    try:
+        from core.cache_manager import get_cache
+        get_cache().set("system_status_snapshot", result, ttl_seconds=2.0)
+    except Exception:
+        pass
+
+    return result
 
 
 class SystemMonitor:

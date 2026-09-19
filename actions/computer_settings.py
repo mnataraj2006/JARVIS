@@ -587,14 +587,73 @@ _DANGEROUS_ACTIONS = {"restart", "shutdown"}
 
 
 def _detect_action(description: str) -> dict:
+    d = description.lower().strip()
 
-    from google import genai as _genai
-    _client = _genai.Client(api_key=_get_api_key())
+    # Fast local deterministic mapping (0 ms, no API call)
+    if d in ACTION_MAP:
+        return {"action": d, "value": None}
+    
+    # Volume patterns
+    if any(k in d for k in ("volume up", "increase volume", "raise volume", "louder")):
+        return {"action": "volume_up", "value": None}
+    if any(k in d for k in ("volume down", "decrease volume", "lower volume", "quieter")):
+        return {"action": "volume_down", "value": None}
+    if any(k in d for k in ("unmute", "mute", "toggle mute", "silence")):
+        return {"action": "mute", "value": None}
+    vol_match = re.search(r"(?:volume\s+(?:to\s+)?|set\s+volume\s+)(\d+)", d)
+    if vol_match:
+        return {"action": "volume_set", "value": int(vol_match.group(1))}
 
-    available = ", ".join(sorted(ACTION_MAP.keys())) + \
-                ", volume_set, type_text, press_key, reload_n"
+    # Brightness patterns
+    if any(k in d for k in ("brightness up", "increase brightness", "brighter")):
+        return {"action": "brightness_up", "value": None}
+    if any(k in d for k in ("brightness down", "decrease brightness", "dimmer")):
+        return {"action": "brightness_down", "value": None}
+    br_match = re.search(r"(?:brightness\s+(?:to\s+)?|set\s+brightness\s+)(\d+)", d)
+    if br_match:
+        return {"action": "brightness_set", "value": int(br_match.group(1))}
 
-    prompt = f"""You are an intent detector for a computer control assistant.
+    # Screenshot & lock
+    if any(k in d for k in ("screenshot", "screen capture", "capture screen")):
+        return {"action": "screenshot", "value": None}
+    if any(k in d for k in ("lock screen", "lock computer", "lock pc")):
+        return {"action": "lock_screen", "value": None}
+
+    # Scroll & zoom
+    if "scroll up" in d:
+        return {"action": "scroll_up", "value": 500}
+    if "scroll down" in d:
+        return {"action": "scroll_down", "value": 500}
+    if "zoom in" in d:
+        return {"action": "zoom_in", "value": None}
+    if "zoom out" in d:
+        return {"action": "zoom_out", "value": None}
+    if "zoom reset" in d:
+        return {"action": "zoom_reset", "value": None}
+
+    # Key press
+    if "press enter" in d or d == "enter":
+        return {"action": "enter", "value": None}
+    if "press escape" in d or d == "escape":
+        return {"action": "escape", "value": None}
+
+    # Window
+    if any(k in d for k in ("maximize", "fullscreen", "full screen")):
+        return {"action": "fullscreen", "value": None}
+    if "minimize" in d:
+        return {"action": "minimize", "value": None}
+    if any(k in d for k in ("close window", "close tab")):
+        return {"action": "close_tab" if "tab" in d else "close_window", "value": None}
+
+    # If no local pattern matches, fallback to Gemini Lite
+    try:
+        from google import genai as _genai
+        _client = _genai.Client(api_key=_get_api_key())
+
+        available = ", ".join(sorted(ACTION_MAP.keys())) + \
+                    ", volume_set, type_text, press_key, reload_n"
+
+        prompt = f"""You are an intent detector for a computer control assistant.
 
 The user issued a command (possibly in any language): "{description}"
 
@@ -612,7 +671,6 @@ Rules:
 - If no clear match, pick the closest action.
 - Return ONLY the JSON, no explanation, no markdown."""
 
-    try:
         resp = _client.models.generate_content(model="gemini-flash-lite-latest", contents=prompt)
         text = re.sub(r"```(?:json)?", "", resp.text).strip().rstrip("`").strip()
         return json.loads(text)

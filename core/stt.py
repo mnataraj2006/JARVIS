@@ -121,17 +121,23 @@ class WhisperSTT:
                     ) from _dl_err
             raise
 
-    def transcribe(self, audio: np.ndarray) -> str:
-        """Transcribe a float32 mono 16 kHz numpy array. Returns transcript string."""
+    def transcribe(self, audio: np.ndarray, mode: str = "fast") -> str:
+        """Transcribe a float32 mono 16 kHz numpy array. Returns transcript string.
+        mode='fast': low latency, min_silence_duration_ms=180, beam_size=1
+        mode='accurate': beam_size=3, min_silence_duration_ms=350
+        """
+        is_fast = (mode == "fast")
+        silence_ms = 180 if is_fast else 350
+        beam = 1 if is_fast else 3
         try:
             segments, _ = self._model.transcribe(
                 audio,
                 language=self._language,
-                beam_size=1,                       # greedy — 2-3x faster
+                beam_size=beam,
                 best_of=1,
-                condition_on_previous_text=False,  # no hallucinations, faster
+                condition_on_previous_text=False,
                 vad_filter=True,
-                vad_parameters={"min_silence_duration_ms": 300},
+                vad_parameters={"min_silence_duration_ms": silence_ms},
             )
             return " ".join(s.text for s in segments).strip()
         except Exception as e:
@@ -146,11 +152,11 @@ class WhisperSTT:
                     segments, _ = self._model.transcribe(
                         audio,
                         language=self._language,
-                        beam_size=1,
+                        beam_size=beam,
                         best_of=1,
                         condition_on_previous_text=False,
                         vad_filter=True,
-                        vad_parameters={"min_silence_duration_ms": 300},
+                        vad_parameters={"min_silence_duration_ms": silence_ms},
                     )
                     return " ".join(s.text for s in segments).strip()
                 except Exception as fallback_err:
@@ -158,6 +164,11 @@ class WhisperSTT:
                     raise
             print(f"[STT] Transcription error: {e}")
             raise
+
+    def transcribe_bytes(self, pcm_bytes: bytes, sample_rate: int = 16000, mode: str = "fast") -> str:
+        """Convenience method to transcribe raw int16 PCM bytes directly."""
+        audio_np = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        return self.transcribe(audio_np, mode=mode)
 
 
 class VoskSTT:

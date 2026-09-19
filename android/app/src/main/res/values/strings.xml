@@ -1,0 +1,6 @@
+<resources>
+    <string name="app_name">JARVIS Mobile Agent</string>
+    <string name="accessibility_service_label">JARVIS Mobile Control Service</string>
+    <string name="accessibility_service_desc">Enables JARVIS desktop to safely navigate, click, type, and automate UI actions requested by Tony Stark.</string>
+    <string name="notification_listener_service_label">JARVIS Notification Gateway</string>
+</resources>

@@ -11,6 +11,7 @@ Install deps:  pip install fastapi "uvicorn[standard]" cryptography
 import asyncio
 import base64
 import hashlib
+import json
 import re
 import secrets
 import socket
@@ -834,6 +835,118 @@ class DashboardServer:
                 pass
             finally:
                 self._clients.discard(websocket)
+
+        # ── Mobile Agent (Android Full Control Companion) ─────────────────────
+
+        @app.get("/api/devices")
+        async def list_devices_ep(req: Request):
+            from core.device_manager import get_device_manager
+            return JSONResponse({"devices": get_device_manager().list_devices()})
+
+        @app.post("/api/device-command")
+        async def device_command_ep(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            body = await req.json()
+            action = body.get("action", "")
+            params = body.get("parameters", {})
+            target = body.get("target_device", "phone")
+            from core.device_manager import get_device_manager
+            res = await get_device_manager().send_command(action, params, target_device=target)
+            return JSONResponse({
+                "success": res.success,
+                "command_id": res.command_id,
+                "data": res.data,
+                "error": res.error,
+                "execution_time_ms": res.execution_time_ms,
+            })
+
+        @app.websocket("/ws/mobile-agent")
+        async def mobile_agent_ws(websocket: WebSocket, token: str = ""):
+            tok = token.strip()
+            is_authed = bool(tok and (tok in self._tokens or tok in self._device_sessions or tok in self._pending_keys))
+            await websocket.accept()
+
+            registered_dev_id = None
+            from core.device_manager import get_device_manager
+            dev_mgr = get_device_manager()
+
+            try:
+                # If not pre-authenticated via query param, negotiate handshake
+                if not is_authed:
+                    init_raw = await websocket.receive_text()
+                    init_data = json.loads(init_raw) if init_raw else {}
+                    t = init_data.get("token") or init_data.get("device_token") or init_data.get("pin") or ""
+                    if t in self._tokens or t in self._device_sessions:
+                        is_authed = True
+                    elif t in self._pending_keys and self._pending_keys[t] > time.time():
+                        del self._pending_keys[t]
+                        fresh_tok = secrets.token_urlsafe(32)
+                        fresh_dev_tok = secrets.token_urlsafe(32)
+                        self._tokens.add(fresh_tok)
+                        self._token_keys[fresh_tok] = t
+                        self._device_sessions[fresh_dev_tok] = {"session_key": t}
+                        is_authed = True
+                        await websocket.send_text(json.dumps({
+                            "type": "handshake_ok",
+                            "token": fresh_tok,
+                            "device_token": fresh_dev_tok,
+                        }))
+                    else:
+                        await websocket.send_text(json.dumps({
+                            "type": "error",
+                            "message": "Unauthorized: invalid device token or PIN",
+                        }))
+                        await websocket.close(code=4001)
+                        return
+
+                    dev_payload = init_data.get("device", {})
+                    if dev_payload:
+                        dev = dev_mgr.register_device(dev_payload, ws=websocket)
+                        registered_dev_id = dev.id
+
+                while True:
+                    msg = await websocket.receive()
+                    if "text" in msg:
+                        data = json.loads(msg["text"])
+                        msg_type = data.get("type")
+                        if msg_type == "register":
+                            dev_info = data.get("device", {})
+                            dev = dev_mgr.register_device(dev_info, ws=websocket)
+                            registered_dev_id = dev.id
+                            await websocket.send_text(json.dumps({"type": "registered", "id": dev.id}))
+                            asyncio.create_task(self.broadcast({
+                                "type": "sys",
+                                "text": f"Android device connected: {dev.name}",
+                            }))
+                        elif msg_type == "response":
+                            dev_mgr.handle_command_response(data)
+                        elif msg_type == "heartbeat":
+                            if registered_dev_id:
+                                dev_mgr.update_heartbeat(registered_dev_id, data)
+                        elif msg_type == "event":
+                            event_name = data.get("event", "")
+                            payload = data.get("data", {})
+                            dev_mgr.handle_incoming_event(event_name, payload)
+                            asyncio.create_task(self.broadcast({
+                                "type": "device_event",
+                                "device_id": registered_dev_id,
+                                "event": event_name,
+                                "data": payload,
+                            }))
+                    elif "bytes" in msg:
+                        dev_mgr.handle_screen_frame(msg["bytes"])
+            except WebSocketDisconnect:
+                pass
+            except Exception as e:
+                print(f"[MobileAgentWS] Error: {e}")
+            finally:
+                if registered_dev_id:
+                    dev_mgr.unregister_device(registered_dev_id)
+                    asyncio.create_task(self.broadcast({
+                        "type": "sys",
+                        "text": f"Android device disconnected: {registered_dev_id}",
+                    }))
 
         return app
 

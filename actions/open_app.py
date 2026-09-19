@@ -78,7 +78,23 @@ def _normalize(raw: str) -> str:
     return raw  
 
 def _launch_windows(app_name: str) -> bool:
+    # 1. Check AppIndex cache first (covers Start Menu shortcuts, common exes, AppData)
+    try:
+        from core.cache_manager import get_app_index
+        app_path = get_app_index().find_app(app_name)
+        if app_path:
+            try:
+                if app_path.lower().endswith(".lnk") or os.path.exists(app_path):
+                    os.startfile(app_path)
+                    return True
+                subprocess.Popen(app_path, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return True
+            except Exception as e:
+                print(f"[open_app] Launch from AppIndex failed: {e}")
+    except Exception:
+        pass
 
+    # 2. Direct binary lookup on PATH
     if shutil.which(app_name) or shutil.which(app_name.split(".")[0]):
         try:
             subprocess.Popen(
@@ -87,28 +103,31 @@ def _launch_windows(app_name: str) -> bool:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            time.sleep(1.5)
             return True
         except Exception as e:
             print(f"[open_app] subprocess failed: {e}")
 
+    # 3. Protocol handler (e.g. ms-settings:, calc:, mailto:)
     if ":" in app_name:
         try:
-            subprocess.Popen(f"start {app_name}", shell=True)
-            time.sleep(1.0)
+            os.startfile(app_name)
             return True
         except Exception:
-            pass
+            try:
+                subprocess.Popen(f"start {app_name}", shell=True)
+                return True
+            except Exception:
+                pass
 
+    # 4. Fallback Start Menu search (reduced waits, no 2.5s freeze)
     try:
         import pyautogui
-        pyautogui.PAUSE = 0.1
+        pyautogui.PAUSE = 0.02
         pyautogui.press("win")
-        time.sleep(0.7)
-        pyautogui.write(app_name, interval=0.05)
-        time.sleep(0.9)
+        time.sleep(0.15)
+        pyautogui.write(app_name, interval=0.01)
+        time.sleep(0.2)
         pyautogui.press("enter")
-        time.sleep(2.5)
         return True
     except Exception as e:
         print(f"[open_app] Start Menu search failed: {e}")

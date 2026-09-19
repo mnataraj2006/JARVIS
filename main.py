@@ -74,6 +74,11 @@ from actions.background_monitor import (
 from actions.web_search        import _news as _fetch_news_sync
 from memory.config_manager     import get_brief_enabled
 from core.plugin_loader        import discover_plugins
+from core.latency_tracker      import get_latency_tracker, RequestMetrics
+from core.fast_router          import get_fast_router, CommandClass, RouteResult
+from core.cache_manager        import get_cache, get_app_index, get_screenshot_cache
+from core.tts                  import get_streaming_tts_queue
+from core.device_manager        import get_device_manager, TargetDevice
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -595,6 +600,33 @@ TOOL_DECLARATIONS = [
             "required": ["category", "key", "value"]
         }
     },
+    {
+        "name": "phone_control",
+        "description": (
+            "Controls the connected Android phone. "
+            "Use for: launching apps on phone, closing apps, tapping/clicking screen elements, "
+            "typing text on phone, pressing home/back/recent buttons, taking phone screenshots, "
+            "checking phone battery/storage/device info, phone volume, flashlight, ringing/locating phone, "
+            "reading phone notifications, copying/syncing clipboard with phone, and sending files to phone."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": "launch_app | close_app | tap | click_text | type | home | back | recents | lock | screenshot | battery | device_info | volume | flashlight | ring | notifications | clipboard_get | clipboard_set | send_file"
+                },
+                "app_name":     {"type": "STRING", "description": "Name of app to launch (e.g. 'WhatsApp', 'YouTube', 'Camera', 'Spotify')"},
+                "package_name": {"type": "STRING", "description": "Android package name (optional if app_name given)"},
+                "text":         {"type": "STRING", "description": "Text to type or element label to click"},
+                "x":            {"type": "INTEGER", "description": "X screen coordinate for tap (0-1000 or absolute)"},
+                "y":            {"type": "INTEGER", "description": "Y screen coordinate for tap (0-1000 or absolute)"},
+                "value":        {"type": "STRING", "description": "Value for volume, state, or clipboard text"},
+                "file_path":    {"type": "STRING", "description": "Path of file to send to phone"},
+            },
+            "required": ["action"]
+        }
+    },
 ]
 
 class JarvisLive:
@@ -629,6 +661,12 @@ class JarvisLive:
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
 
         self._enhanced_live = True  # affective dialog + proactive audio; auto-disabled if the server rejects them
+        self._latency_tracker = get_latency_tracker()
+        self._fast_router     = get_fast_router()
+        self._app_index       = get_app_index()
+        self._streaming_tts   = get_streaming_tts_queue()
+        self._device_manager  = get_device_manager()
+
         _core_names = {t["name"] for t in TOOL_DECLARATIONS}
         self._plugin_registry = discover_plugins(
             plugins_dir=Path(__file__).resolve().parent / "plugins",
@@ -679,15 +717,167 @@ class JarvisLive:
         return url, key, f"{url}/auto-login?key={key}", manual
 
     def _on_text_command(self, text: str):
+        if not text or not text.strip():
+            return
+
+        text = text.strip()
+        route = self._fast_router.route(text)
+        req = self._latency_tracker.start_request(command_text=text, command_class=route.command_class)
+        req.router_ms = route.routing_latency_ms
+
+        # P0 Interruption
+        if route.is_interruption:
+            req.is_fast_path = True
+            req.mark_action_start()
+            self.interrupt()
+            req.mark_action_end()
+            self._latency_tracker.record_completed(req)
+            return
+
+        # Fast Path Deterministic Execution (Level 0 - zero LLM call)
+        if route.matched and route.escalation_level == 0 and not route.requires_confirmation:
+            req.is_fast_path = True
+            self._session_log.append(f"User: {text}")
+            self.ui.write_log(f"You: {text}")
+
+            loop = getattr(self, "_loop", None) or asyncio.get_event_loop()
+
+            async def _run_fast():
+                try:
+                    req.mark_action_start()
+                    action = route.action
+                    params = route.parameters
+                    reply = route.response_template
+
+                    if action == "open_app":
+                        app_n = params.get("app_name", "")
+                        self.ui.write_log(f"⚡ Opening {app_n}...")
+                        self.ui.set_state("EXECUTING")
+                        res = await asyncio.to_thread(open_app, parameters=params, player=self.ui)
+                        reply = res or f"Opened {app_n}."
+
+                    elif action in (
+                        "volume_up", "volume_down", "mute", "volume_set",
+                        "brightness_up", "brightness_down", "brightness_set",
+                        "screenshot", "lock_screen", "enter", "escape",
+                        "scroll_up", "scroll_down", "type_text",
+                    ):
+                        self.ui.set_state("EXECUTING")
+                        res = await asyncio.to_thread(
+                            computer_settings, parameters={"action": action, **params}, player=self.ui
+                        )
+                        if not reply:
+                            reply = res or "Done."
+
+                    elif action == "close_app":
+                        app_n = params.get("app_name", "")
+                        self.ui.set_state("EXECUTING")
+                        res = await asyncio.to_thread(
+                            computer_settings, parameters={"action": "close_app", "value": app_n}, player=self.ui
+                        )
+                        reply = res or f"Closed {app_n}."
+
+                    elif action == "time":
+                        now_str = datetime.now().strftime("%I:%M %p")
+                        reply = f"It is {now_str}."
+
+                    elif action == "date":
+                        date_str = datetime.now().strftime("%A, %B %d, %Y")
+                        reply = f"Today is {date_str}."
+
+                    elif action.startswith("system_status"):
+                        status = await asyncio.to_thread(get_system_status)
+                        if action == "system_status_cpu":
+                            reply = f"CPU usage is currently {status.get('cpu_percent')}%."
+                        elif action == "system_status_ram":
+                            reply = f"RAM usage is {status.get('ram_percent')}%, with {status.get('ram_used_gb')} GB of {status.get('ram_total_gb')} GB in use."
+                        elif action == "system_status_gpu":
+                            gpu = status.get("gpu_percent")
+                            reply = f"GPU load is {gpu}%." if gpu is not None else "GPU metrics are currently not available."
+                        else:
+                            reply = f"System performance: CPU at {status.get('cpu_percent')}%, RAM at {status.get('ram_percent')}%, Uptime: {status.get('uptime')}."
+
+                    elif action.startswith("phone_"):
+                        self.ui.set_state("EXECUTING")
+                        phone_cmd = action.removeprefix("phone_")
+                        if phone_cmd == "launch_app":
+                            app_n = params.get("app_name", "")
+                            self.ui.write_log(f"📱 Launching {app_n} on phone...")
+                            res = await self._device_manager.send_command("launch_app", {"app_name": app_n})
+                            reply = res.data.get("message") if (res.success and isinstance(res.data, dict)) else (res.error if not res.success else f"Launched {app_n} on phone.")
+                        elif phone_cmd == "battery":
+                            phone = self._device_manager.get_primary_phone()
+                            if phone and phone.online and phone.battery_level is not None:
+                                chg = " (charging)" if phone.is_charging else ""
+                                reply = f"Phone battery is at {phone.battery_level}%{chg}."
+                            else:
+                                res = await self._device_manager.send_command("battery", {})
+                                reply = f"Phone battery is at {res.data.get('level')}%." if (res.success and isinstance(res.data, dict)) else (res.error or "Could not fetch phone battery.")
+                        elif phone_cmd == "screenshot":
+                            res = await self._device_manager.send_command("screenshot", {})
+                            reply = "Captured phone screenshot." if res.success else (res.error or "Failed to capture phone screenshot.")
+                        elif phone_cmd in ("volume_up", "volume_down", "mute"):
+                            v_act = phone_cmd.removeprefix("volume_")
+                            res = await self._device_manager.send_command("volume", {"action": v_act, **params})
+                            reply = f"Phone {phone_cmd.replace('_', ' ')}." if res.success else (res.error or "Phone volume failed.")
+                        elif phone_cmd in ("lock", "home", "back", "ring", "notifications"):
+                            res = await self._device_manager.send_command(phone_cmd, params)
+                            if not reply:
+                                reply = "Done." if res.success else (res.error or f"Failed to execute {phone_cmd} on phone.")
+
+                    elif action == "clipboard_sync":
+                        self.ui.set_state("EXECUTING")
+                        try:
+                            import pyperclip
+                            clip_text = pyperclip.paste()
+                            res = await self._device_manager.send_command("clipboard_set", {"text": clip_text})
+                            reply = "Synced PC clipboard to phone." if res.success else (res.error or "Failed to sync clipboard.")
+                        except Exception as e:
+                            reply = f"Clipboard sync error: {e}"
+
+                    req.mark_action_end()
+                    req.mark_first_response()
+
+                    if reply:
+                        self.ui.write_log(f"{self._asst_name}: {reply}")
+                        self._session_log.append(f"{self._asst_name}: {reply}")
+                        req.mark_first_audio()
+                        if self.session and hasattr(self.session, "send_client_content"):
+                            self.speak(reply)
+
+                    if not self.ui.muted:
+                        self.ui.set_state("LISTENING")
+
+                except Exception as ex:
+                    print(f"[FastRouter] Error running fast action {route.action}: {ex}")
+                    self.ui.write_log(f"ERR: {ex}")
+                finally:
+                    self._latency_tracker.record_completed(req)
+
+            if loop and loop.is_running():
+                asyncio.run_coroutine_threadsafe(_run_fast(), loop)
+            else:
+                threading.Thread(target=lambda: asyncio.run(_run_fast()), daemon=True).start()
+            return
+
+        # Escalate to LLM / Gemini Live (Level 1-4)
         if not self._loop or not self.session:
             return
-        asyncio.run_coroutine_threadsafe(
-            self.session.send_client_content(
-                turns={"parts": [{"text": text}]},
-                turn_complete=True
-            ),
-            self._loop
-        )
+
+        async def _forward_llm():
+            req.mark_action_start()
+            try:
+                await self.session.send_client_content(
+                    turns={"parts": [{"text": text}]},
+                    turn_complete=True
+                )
+            except Exception as e:
+                print(f"[JARVIS] LLM send error: {e}")
+            finally:
+                req.mark_action_end()
+                self._latency_tracker.record_completed(req)
+
+        asyncio.run_coroutine_threadsafe(_forward_llm(), self._loop)
 
     def set_speaking(self, value: bool):
         with self._speaking_lock:
@@ -700,6 +890,7 @@ class JarvisLive:
     def interrupt(self) -> None:
         """Stop JARVIS mid-speech: drain queued audio and open mic immediately."""
         self._interrupted = True
+        self._streaming_tts.stop_immediately()
         q = self.audio_in_queue
         if q:
             drained = 0
@@ -804,6 +995,7 @@ class JarvisLive:
     async def _execute_tool(self, fc) -> types.FunctionResponse:
         name = fc.name
         args = dict(fc.args or {})
+        t_tool_start = time.monotonic()
 
         print(f"[JARVIS] 🔧 {name}  {args}")
         self.ui.set_state("THINKING")
@@ -979,6 +1171,19 @@ class JarvisLive:
                     _os._exit(0)
                 asyncio.create_task(_do_shutdown())
 
+            elif name == "phone_control":
+                action = args.get("action", "")
+                res = await self._device_manager.send_command(action, args)
+                if res.success:
+                    if isinstance(res.data, dict) and "message" in res.data:
+                        result = res.data["message"]
+                    elif res.data is not None:
+                        result = str(res.data)
+                    else:
+                        result = f"Successfully executed {action} on phone."
+                else:
+                    result = f"Phone action failed: {res.error}"
+
             else:
                 if self._plugin_registry.has(name):
                     r = await loop.run_in_executor(
@@ -997,7 +1202,8 @@ class JarvisLive:
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
 
-        print(f"[JARVIS] 📤 {name} → {str(result)[:80]}")
+        tool_duration_ms = (time.monotonic() - t_tool_start) * 1000
+        print(f"[JARVIS] 📤 {name} ({tool_duration_ms:.1f}ms) → {str(result)[:80]}")
         return types.FunctionResponse(
             id=fc.id, name=name,
             response={"result": result}
@@ -1112,6 +1318,9 @@ class JarvisLive:
                             if txt:
                                 in_buf.append(txt)
                                 self._last_user_speech = time.monotonic()
+                                if self._fast_router.route(txt).is_interruption:
+                                    print(f"[JARVIS] ✋ P0 Voice Interruption: '{txt}'")
+                                    self.interrupt()
 
                         if sc.turn_complete:
                             if self._turn_done_event:

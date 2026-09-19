@@ -108,6 +108,12 @@ def _compress(img_bytes: bytes, source_format: str = "PNG") -> tuple[bytes, str]
         return img_bytes, f"image/{source_format.lower()}"
 
 def _capture_screen() -> tuple[bytes, str]:
+    from core.cache_manager import get_screenshot_cache
+    sc = get_screenshot_cache()
+    cached = sc.get_valid_screenshot()
+    if cached is not None:
+        print("[Vision] ⚡ Reusing fresh screenshot from cache (< 1.5s)")
+        return cached
 
     if not _MSS:
         raise RuntimeError("mss is not installed. Run: pip install mss")
@@ -118,7 +124,9 @@ def _capture_screen() -> tuple[bytes, str]:
         shot     = sct.grab(target)
         png      = mss.tools.to_png(shot.rgb, shot.size)
 
-    return _compress(png, "PNG")
+    compressed, mime = _compress(png, "PNG")
+    sc.store(compressed, mime)
+    return compressed, mime
 
 
 _last_screen_hash: int | None = None
