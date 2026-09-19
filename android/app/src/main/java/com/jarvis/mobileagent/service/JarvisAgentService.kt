@@ -73,7 +73,19 @@ class JarvisAgentService : Service() {
             wsManager.sendEvent("notification", payload)
         }
 
-        startForeground(NOTIFICATION_ID, buildNotification("Initializing..."))
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    buildNotification("Initializing..."),
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, buildNotification("Initializing..."))
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "startForeground non-fatal error: ${e.message}")
+        }
         startHeartbeat()
     }
 
