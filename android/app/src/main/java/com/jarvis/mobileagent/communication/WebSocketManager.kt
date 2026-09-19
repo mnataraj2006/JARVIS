@@ -2,12 +2,14 @@ package com.jarvis.mobileagent.communication
 
 import android.util.Log
 import com.google.gson.Gson
-import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import kotlinx.coroutines.*
 import okhttp3.*
 import okio.ByteString
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
 import java.util.concurrent.TimeUnit
+import javax.net.ssl.*
 
 class WebSocketManager(
     private val pairingManager: PairingManager,
@@ -16,27 +18,61 @@ class WebSocketManager(
 ) {
     private val TAG = "JarvisWebSocket"
     private val gson = Gson()
-    private val client = OkHttpClient.Builder()
-        .pingInterval(10, TimeUnit.SECONDS)
-        .connectTimeout(8, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.MILLISECONDS)
-        .build()
+    private val client: OkHttpClient = createOkHttpClient()
 
     private var webSocket: WebSocket? = null
     private var isConnected = false
     private var isConnecting = false
     private var shouldReconnect = true
     private var reconnectAttempt = 0
+    private var activePin: String? = null
+    private var reconnectJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    fun connect(pin: String? = null) {
-        if (isConnecting || isConnected) return
+    private fun createOkHttpClient(): OkHttpClient {
+        val trustAllCerts = arrayOf<TrustManager>(object : X509TrustManager {
+            override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+            override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+            override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+        })
+
+        val sslContext = SSLContext.getInstance("TLS")
+        sslContext.init(null, trustAllCerts, SecureRandom())
+
+        return OkHttpClient.Builder()
+            .sslSocketFactory(sslContext.socketFactory, trustAllCerts[0] as X509TrustManager)
+            .hostnameVerifier { _, _ -> true }
+            .pingInterval(10, TimeUnit.SECONDS)
+            .connectTimeout(8, TimeUnit.SECONDS)
+            .readTimeout(0, TimeUnit.MILLISECONDS)
+            .build()
+    }
+
+    fun connect(pin: String? = null, force: Boolean = false) {
+        if (!pin.isNullOrBlank()) {
+            activePin = pin.trim().uppercase()
+            pairingManager.lastPin = activePin
+        } else if (activePin.isNullOrBlank()) {
+            activePin = pairingManager.lastPin
+        }
+
+        if (!force && (isConnecting || isConnected)) {
+            Log.d(TAG, "Already connected or connecting, skipping connect()")
+            return
+        }
+
+        reconnectJob?.cancel()
+        try {
+            webSocket?.cancel()
+        } catch (_: Exception) {}
+        webSocket = null
+        isConnected = false
         isConnecting = true
         shouldReconnect = true
 
         val url = pairingManager.getWsUrl()
-        Log.d(TAG, "Connecting to JARVIS desktop at $url...")
-        onConnectionStateChanged(false, "Connecting...")
+        Log.d(TAG, "Connecting to JARVIS desktop at $url (pin: ${activePin ?: "none"})...")
+        onConnectionStateChanged(false, "Connecting to $url...")
 
         val request = Request.Builder().url(url).build()
 
@@ -45,11 +81,11 @@ class WebSocketManager(
                 isConnected = true
                 isConnecting = false
                 reconnectAttempt = 0
-                Log.d(TAG, "Connected to JARVIS desktop!")
+                Log.d(TAG, "Connected to JARVIS desktop over $url!")
                 onConnectionStateChanged(true, "Connected")
 
                 // Send handshake / registration
-                sendHandshake(ws, pin)
+                sendHandshake(ws, activePin)
             }
 
             override fun onMessage(ws: WebSocket, text: String) {
@@ -64,6 +100,7 @@ class WebSocketManager(
                             if (!token.isNullOrBlank()) pairingManager.authToken = token
                             if (!devToken.isNullOrBlank()) pairingManager.deviceToken = devToken
                             Log.d(TAG, "Handshake authenticated successfully")
+                            onConnectionStateChanged(true, "Connected & Paired")
                         }
                         "command" -> {
                             val cmd = gson.fromJson(text, CommandFrame::class.java)
@@ -71,10 +108,12 @@ class WebSocketManager(
                         }
                         "registered" -> {
                             Log.d(TAG, "Device registration confirmed by desktop")
+                            onConnectionStateChanged(true, "Connected & Registered")
                         }
                         "error" -> {
                             val msg = root.get("message")?.asString ?: "Unknown error"
                             Log.e(TAG, "Desktop error: $msg")
+                            onConnectionStateChanged(false, "Error: $msg")
                         }
                         else -> {
                             Log.d(TAG, "Received message: $text")
@@ -100,8 +139,18 @@ class WebSocketManager(
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
                 isConnected = false
                 isConnecting = false
-                Log.w(TAG, "Connection failure: ${t.message}")
-                onConnectionStateChanged(false, "Connection failed: ${t.message}")
+                val err = t.message ?: "Connection failed"
+                Log.w(TAG, "Connection failure ($url): $err")
+
+                // If TLS failed, toggle to plain WS for the next attempt, or vice-versa
+                if (pairingManager.useTls) {
+                    Log.d(TAG, "TLS attempt failed, trying plain ws next...")
+                    pairingManager.useTls = false
+                } else {
+                    pairingManager.useTls = true
+                }
+
+                onConnectionStateChanged(false, "Failed: $err")
                 scheduleReconnect()
             }
         })
@@ -168,6 +217,7 @@ class WebSocketManager(
 
     fun disconnect() {
         shouldReconnect = false
+        reconnectJob?.cancel()
         webSocket?.close(1000, "User disconnected")
         webSocket = null
         isConnected = false
@@ -177,13 +227,14 @@ class WebSocketManager(
 
     private fun scheduleReconnect() {
         if (!shouldReconnect) return
-        scope.launch {
+        reconnectJob?.cancel()
+        reconnectJob = scope.launch {
             reconnectAttempt++
-            val delaySeconds = (2 * reconnectAttempt).coerceAtMost(20)
+            val delaySeconds = (2 * reconnectAttempt).coerceAtMost(15)
             Log.d(TAG, "Reconnecting in ${delaySeconds}s (attempt #$reconnectAttempt)...")
             onConnectionStateChanged(false, "Reconnecting in ${delaySeconds}s...")
             delay(delaySeconds * 1000L)
-            connect()
+            connect(activePin)
         }
     }
 }

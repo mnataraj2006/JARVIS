@@ -28,14 +28,27 @@ fun DashboardScreen(
 ) {
     var hostText by remember { mutableStateOf(pairingManager.serverHost) }
     var portText by remember { mutableStateOf(pairingManager.serverPort.toString()) }
-    var pinText by remember { mutableStateOf("") }
+    var pinText by remember { mutableStateOf(pairingManager.lastPin ?: "") }
+    var useTls by remember { mutableStateOf(pairingManager.useTls) }
 
     val status = service?.connectionStatus ?: "Service Inactive"
-    val isConnected = status == "Connected"
+    val isConnected = status.startsWith("Connected")
+    val isConnecting = status.startsWith("Connecting")
 
     val batteryInfo = service?.deviceInfoManager?.getBatteryInfo()
     val storageInfo = service?.deviceInfoManager?.getStorageInfo()
     val networkInfo = service?.deviceInfoManager?.getNetworkInfo()
+
+    val badgeBg = when {
+        isConnected -> Color(0xFF0F392B)
+        isConnecting -> Color(0xFF162536)
+        else -> Color(0xFF271B1B)
+    }
+    val badgeFg = when {
+        isConnected -> Color(0xFF10B981)
+        isConnecting -> Color(0xFF00E5FF)
+        else -> Color(0xFFEF4444)
+    }
 
     Column(
         modifier = Modifier
@@ -71,7 +84,7 @@ fun DashboardScreen(
             // Connection Badge
             Surface(
                 shape = RoundedCornerShape(20.dp),
-                color = if (isConnected) Color(0xFF0F392B) else Color(0xFF271B1B)
+                color = badgeBg
             ) {
                 Row(
                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
@@ -80,15 +93,12 @@ fun DashboardScreen(
                     Box(
                         modifier = Modifier
                             .size(8.dp)
-                            .background(
-                                color = if (isConnected) Color(0xFF10B981) else Color(0xFFEF4444),
-                                shape = CircleShape
-                            )
+                            .background(color = badgeFg, shape = CircleShape)
                     )
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = status,
-                        color = if (isConnected) Color(0xFF10B981) else Color(0xFFEF4444),
+                        text = if (isConnected) "Connected" else if (isConnecting) "Connecting..." else "Disconnected",
+                        color = badgeFg,
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Bold
                     )
@@ -117,7 +127,7 @@ fun DashboardScreen(
                 OutlinedTextField(
                     value = hostText,
                     onValueChange = { hostText = it },
-                    label = { Text("PC IP Address (e.g. 192.168.1.100)") },
+                    label = { Text("PC IP Address (e.g. 192.168.31.43)") },
                     modifier = Modifier.fillMaxWidth(),
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedBorderColor = Color(0xFF00E5FF),
@@ -149,7 +159,7 @@ fun DashboardScreen(
 
                     OutlinedTextField(
                         value = pinText,
-                        onValueChange = { pinText = it },
+                        onValueChange = { pinText = it.uppercase() },
                         label = { Text("6-Digit PIN") },
                         modifier = Modifier.weight(1.5f),
                         colors = OutlinedTextFieldDefaults.colors(
@@ -162,19 +172,45 @@ fun DashboardScreen(
                     )
                 }
 
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Switch(
+                        checked = useTls,
+                        onCheckedChange = {
+                            useTls = it
+                            pairingManager.useTls = it
+                        },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Color(0xFF00E5FF),
+                            checkedTrackColor = Color(0xFF005577)
+                        )
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = if (useTls) "Secure WSS (JARVIS Default)" else "Plain WS",
+                        color = Color(0xFF94A3B8),
+                        fontSize = 12.sp
+                    )
+                }
+
                 Spacer(modifier = Modifier.height(14.dp))
 
                 Row(modifier = Modifier.fillMaxWidth()) {
                     Button(
                         onClick = {
                             val port = portText.toIntOrNull() ?: 8000
+                            pairingManager.useTls = useTls
                             onConnect(hostText, port, pinText.ifBlank { null })
                         },
                         modifier = Modifier.weight(1f),
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0077FF)),
                         shape = RoundedCornerShape(8.dp)
                     ) {
-                        Text(if (isConnected) "Reconnect" else "Connect to PC", fontWeight = FontWeight.Bold)
+                        Text(if (isConnected) "Reconnect" else if (isConnecting) "Connecting..." else "Connect to PC", fontWeight = FontWeight.Bold)
                     }
 
                     if (isConnected) {
@@ -187,6 +223,15 @@ fun DashboardScreen(
                             Text("Disconnect")
                         }
                     }
+                }
+
+                if (!isConnected && status != "Idle" && status != "Service Inactive") {
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Text(
+                        text = status,
+                        color = if (isConnecting) Color(0xFF00E5FF) else Color(0xFFEF4444),
+                        fontSize = 12.sp
+                    )
                 }
             }
         }

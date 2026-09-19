@@ -879,13 +879,20 @@ class DashboardServer:
                     t = init_data.get("token") or init_data.get("device_token") or init_data.get("pin") or ""
                     if t in self._tokens or t in self._device_sessions:
                         is_authed = True
-                    elif t in self._pending_keys and self._pending_keys[t] > time.time():
-                        del self._pending_keys[t]
+                        await websocket.send_text(json.dumps({
+                            "type": "handshake_ok",
+                            "token": t,
+                            "device_token": t,
+                        }))
+                    elif (t in self._pending_keys and self._pending_keys[t] > time.time()) or \
+                         (t.upper() in self._pending_keys and self._pending_keys[t.upper()] > time.time()):
+                        matched_key = t if t in self._pending_keys else t.upper()
+                        del self._pending_keys[matched_key]
                         fresh_tok = secrets.token_urlsafe(32)
                         fresh_dev_tok = secrets.token_urlsafe(32)
                         self._tokens.add(fresh_tok)
-                        self._token_keys[fresh_tok] = t
-                        self._device_sessions[fresh_dev_tok] = {"session_key": t}
+                        self._token_keys[fresh_tok] = matched_key
+                        self._device_sessions[fresh_dev_tok] = {"session_key": matched_key}
                         is_authed = True
                         await websocket.send_text(json.dumps({
                             "type": "handshake_ok",
@@ -904,6 +911,12 @@ class DashboardServer:
                     if dev_payload:
                         dev = dev_mgr.register_device(dev_payload, ws=websocket)
                         registered_dev_id = dev.id
+                        print(f"[MobileAgent] 📱 Android device paired & registered: {dev.name} ({dev.id})")
+                        await websocket.send_text(json.dumps({"type": "registered", "id": dev.id}))
+                        asyncio.create_task(self.broadcast({
+                            "type": "sys",
+                            "text": f"Android device connected: {dev.name}",
+                        }))
 
                 while True:
                     msg = await websocket.receive()
@@ -993,5 +1006,7 @@ class DashboardServer:
 
         proto = "https" if use_ssl else "http"
         print(f"[Dashboard] {proto}://{self._ip}:{PORT}")
+        initial_pin = self.new_key(expiry_secs=86400)
+        print(f"[Dashboard] 🔑 Companion App Pairing PIN: {initial_pin}")
         print("[Dashboard] Press 'Remote Control' in JARVIS UI to get the QR code.")
         await uvicorn.Server(cfg).serve()

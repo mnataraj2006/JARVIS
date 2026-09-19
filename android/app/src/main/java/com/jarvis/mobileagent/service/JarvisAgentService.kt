@@ -6,6 +6,9 @@ import android.app.Service
 import android.content.Intent
 import android.os.IBinder
 import android.util.Log
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.core.app.NotificationCompat
 import com.jarvis.mobileagent.JarvisApp
 import com.jarvis.mobileagent.capabilities.*
@@ -18,8 +21,8 @@ class JarvisAgentService : Service() {
     companion object {
         private const val TAG = "JarvisService"
         private const val NOTIFICATION_ID = 1001
-        var instance: JarvisAgentService? = null
-            private set
+        var instance by mutableStateOf<JarvisAgentService?>(null)
+            internal set
     }
 
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
@@ -43,8 +46,8 @@ class JarvisAgentService : Service() {
     lateinit var fileTransferManager: FileTransferManager
         private set
 
-    var connectionStatus: String = "Idle"
-        private set
+    var connectionStatus by mutableStateOf("Idle")
+        internal set
 
     override fun onCreate() {
         super.onCreate()
@@ -63,8 +66,10 @@ class JarvisAgentService : Service() {
             pairingManager = pairingManager,
             onCommandReceived = { cmd -> handleCommand(cmd) },
             onConnectionStateChanged = { connected, statusText ->
-                connectionStatus = statusText ?: if (connected) "Connected" else "Disconnected"
-                updateNotification(connectionStatus)
+                serviceScope.launch(Dispatchers.Main) {
+                    connectionStatus = statusText ?: if (connected) "Connected" else "Disconnected"
+                    updateNotification(connectionStatus)
+                }
             }
         )
 
@@ -92,9 +97,10 @@ class JarvisAgentService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val pin = intent?.getStringExtra("pairing_pin")
         val shouldConnect = intent?.getBooleanExtra("connect", false) ?: false
+        val force = intent?.getBooleanExtra("force", false) ?: false
 
-        if (shouldConnect || pairingManager.isPaired()) {
-            wsManager.connect(pin)
+        if (shouldConnect || force || pairingManager.isPaired()) {
+            wsManager.connect(pin, force = (force || shouldConnect))
         }
         return START_STICKY
     }

@@ -9,12 +9,20 @@ class PairingManager(context: Context) {
     private val prefs = context.getSharedPreferences("jarvis_mobile_agent_prefs", Context.MODE_PRIVATE)
 
     var serverHost: String
-        get() = prefs.getString("server_host", "192.168.1.100") ?: "192.168.1.100"
+        get() = prefs.getString("server_host", "192.168.31.43") ?: "192.168.31.43"
         set(value) = prefs.edit().putString("server_host", value.trim()).apply()
 
     var serverPort: Int
         get() = prefs.getInt("server_port", 8000)
         set(value) = prefs.edit().putInt("server_port", value).apply()
+
+    var useTls: Boolean
+        get() = prefs.getBoolean("use_tls", true)
+        set(value) = prefs.edit().putBoolean("use_tls", value).apply()
+
+    var lastPin: String?
+        get() = prefs.getString("last_pin", null)
+        set(value) = prefs.edit().putString("last_pin", value?.trim()?.uppercase()).apply()
 
     var deviceToken: String?
         get() = prefs.getString("device_token", null)
@@ -39,7 +47,8 @@ class PairingManager(context: Context) {
         set(value) = prefs.edit().putString("device_name", value).apply()
 
     fun getWsUrl(): String {
-        return "ws://$serverHost:$serverPort/ws/mobile-agent"
+        val proto = if (useTls) "wss" else "ws"
+        return "$proto://$serverHost:$serverPort/ws/mobile-agent"
     }
 
     fun isPaired(): Boolean {

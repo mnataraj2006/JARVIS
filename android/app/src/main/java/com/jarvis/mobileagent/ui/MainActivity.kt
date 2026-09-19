@@ -59,7 +59,10 @@ class MainActivity : ComponentActivity() {
                             onConnect = { host, port, pin ->
                                 pairingManager.serverHost = host
                                 pairingManager.serverPort = port
-                                startAgentService(pin, connect = true)
+                                if (!pin.isNullOrBlank()) {
+                                    pairingManager.lastPin = pin.trim().uppercase()
+                                }
+                                startAgentService(pin, connect = true, force = true)
                             },
                             onDisconnect = {
                                 JarvisAgentService.instance?.wsManager?.disconnect()
@@ -77,10 +80,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun startAgentService(pin: String? = null, connect: Boolean = false) {
+    private fun startAgentService(pin: String? = null, connect: Boolean = false, force: Boolean = false) {
         val intent = Intent(this, JarvisAgentService::class.java).apply {
-            if (!pin.isNullOrBlank()) putExtra("pairing_pin", pin)
+            if (!pin.isNullOrBlank()) putExtra("pairing_pin", pin.trim().uppercase())
             putExtra("connect", connect)
+            putExtra("force", force)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             ContextCompat.startForegroundService(this, intent)
